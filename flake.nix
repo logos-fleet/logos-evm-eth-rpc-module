@@ -36,7 +36,6 @@
       # It is a target, never a host we evaluate nixpkgs natively for, so it
       # only ever belongs in `packages`.
       targets = systems ++ [ "x86_64-windows" ];
-      forAllTargets = f: nixpkgs.lib.genAttrs targets f;
 
       # ONE module, answered for every target at once. mkLogosModule already
       # keys its own outputs by system, so calling it per target built five
@@ -63,8 +62,8 @@
         [ "aarch64-ios" "aarch64-ios-simulator" "aarch64-android" ];
     in
     {
-      packages = forAllTargets (system: module.packages.${system})
-              // nixpkgs.lib.genAttrs mobileTargets (t: module.packages.${t});
+      packages = nixpkgs.lib.genAttrs (targets ++ mobileTargets)
+        (target: module.packages.${target});
 
       # An Android cross derivation's `system` is its BUILD platform, so
       # `packages.aarch64-android` is pinned to the builder's canonical one
