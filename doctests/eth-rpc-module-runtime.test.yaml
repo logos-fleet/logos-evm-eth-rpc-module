@@ -44,9 +44,18 @@ sections:
         text: |
           `eth_rpc_module` is `concurrency: "multi"`, so the daemon resolves its
           deferred replies on the caller's behalf — it must be built against
-          logos-protocol ≥ 0.2. The `--override-input` pins its protocol (and
-          liblogos's) to the chain under test (master, where 0.2 lives).
-        run: "nix build 'github:logos-co/logos-logoscore-cli#cli' --override-input logos-protocol 'github:logos-co/logos-protocol{release}' --override-input logos-liblogos/logos-protocol 'github:logos-co/logos-protocol{release}' --out-link ./logos"
+          logos-protocol ≥ 0.2. logoscore-cli pins 0.8, so its own lock already
+          satisfies that and no `--override-input` is needed.
+
+          The overrides that used to be here moved logos-protocol and
+          logos-liblogos/logos-protocol but not logos-plugin-qt's. An override
+          reaches only the input it names, and logos-qt-host bakes
+          `sizeof(LogosAPIClient)` into its own `operator new` while logos-protocol
+          defines the constructor -- so once protocol 4638634 grew that object
+          88 -> 96 bytes, the pair disagreed and every getClient overran the heap:
+          `free(): invalid next size` on glibc, silent on macOS. Completing the set
+          instead trips logos-plugin-qt's own consumer-admission bound.
+        run: "nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos"
         code_block: |
           nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos
         check_file: "logos/bin/logoscore"
@@ -87,7 +96,7 @@ sections:
         file:
           path: mock_node.py
           content: |
-            import http.server, json
+            import http.server, json, socketserver, time
             RES = {"eth_chainId": "0x1", "eth_getBalance": "0x1234", "eth_blockNumber": "0x10"}
             class H(http.server.BaseHTTPRequestHandler):
                 def do_POST(self):
@@ -100,11 +109,57 @@ sections:
                     self.end_headers()
                     self.wfile.write(body)
                 def log_message(self, *a): pass
-            http.server.HTTPServer(('127.0.0.1', 8599), H).serve_forever()
+            # Threaded because eth_rpc_module is concurrency: "multi" and opens a fresh
+            # connection per call, so the single-threaded server would serialise them.
+            class Node(http.server.ThreadingHTTPServer):
+                # HTTPServer.server_bind() looks the host up in reverse DNS BETWEEN bind() and
+                # listen(), and nothing here needs the FQDN. Until that lookup answers the port
+                # is bound but not yet listening, so a caller's connect never completes; on a CI
+                # box whose resolver drops reverse queries for 127.0.0.1 that ran past 30s and
+                # read as an unreachable node.
+                def server_bind(self):
+                    socketserver.TCPServer.server_bind(self)
+                    self.server_name, self.server_port = self.server_address[:2]
+            t0 = time.time()
+            srv = Node(('127.0.0.1', 8599), H)
+            host, port = srv.server_address[:2]
+            print('listening on %s:%d after %.1fs' % (host, port, time.time() - t0), flush=True)
+            srv.serve_forever()
       - title: "Start the mock node"
         run: "sh -c 'python3 mock_node.py > mock.log 2>&1 &'"
         code_block: "python3 mock_node.py &"
-      - run: "sleep 2"
+      - title: "Write the readiness check"
+        file:
+          path: wait_for_node.py
+          content: |
+            import json, socket, sys, time, urllib.request
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                try:
+                    socket.create_connection(("127.0.0.1", 8599), timeout=1).close()
+                    break
+                except OSError:
+                    time.sleep(0.2)
+            else:
+                try: log = open("mock.log").read().strip() or "(empty)"
+                except OSError: log = "(no mock.log)"
+                sys.exit("nothing accepted on 127.0.0.1:8599 after 30s; mock.log: " + log)
+            req = urllib.request.Request(
+                "http://127.0.0.1:8599",
+                data=json.dumps({"jsonrpc": "2.0", "id": 1,
+                                 "method": "eth_chainId", "params": []}).encode(),
+                headers={"content-type": "application/json"})
+            print("mock node answered:", urllib.request.urlopen(req, timeout=5).read().decode())
+      - title: "Wait until the node answers"
+        text: |
+          `python3 mock_node.py &` returns once the shell has forked, not once the listener is
+          up, so this waits for a connection rather than guessing at a sleep. Answering
+          `eth_chainId` here also separates the fixture from the module: if this passes and the
+          round-trip below fails, the node was reachable and the module's transport is what did
+          not reach it.
+        run: "python3 wait_for_node.py"
+        expect_contains:
+          - '"result": "0x1"'
 
   - title: "Run the daemon and drive the client"
     step: true

@@ -9,6 +9,7 @@
   "category": "wallet",
   "main": "eth_rpc_module_plugin",
   "dependencies": [],
+  "optional_dependencies": ["modules_state", "verified_proxy_module"],
   "include": [],
   "capabilities": [],
   "codegen": {

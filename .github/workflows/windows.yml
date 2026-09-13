@@ -1,0 +1,26 @@
+name: Windows
+
+# The entire per-repo cost of Windows CI. The Nix install and cache, the
+# target-existence guard, the cold-cache refusal, the PE-format and
+# import-closure gates, and the artifact hand-off all live once in
+# logos-co/logos-windows-ci.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  windows:
+    uses: logos-co/logos-windows-ci/.github/workflows/windows-ci.yml@v1
+    secrets: inherit
+    with:
+      targets: default
+      # NO SMOKE, and that is a reported coverage gap rather than a pass. A
+      # module plugin has no entry point, and the harness runs the Windows leg
+      # inside stage/, so anything that could load it would have to be a target
+      # of this flake. That belongs in a consumer's job.
+      # Guards the property that keeps this module portable at all: no nimbus
+      # closure is linked in. See the script for what would actually break it.
+      extra-gates: bash .github/gates/no-nimbus-in-closure.sh

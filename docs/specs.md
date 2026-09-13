@@ -145,11 +145,12 @@ flowchart TB
 | `lib.rs` | crate root | Declares `mod proxy; mod rpc;` and `#[cfg(feature="logos_module")] mod glue;`. Re-exports `ChainConfig`, `EthRpc`, `RpcError`. |
 | `rpc.rs` | `EthRpc` | The RPC client: `HashMap<u64, ChainConfig>` + optional JSON store path; per-chain typed RPC helpers. |
 | `rpc.rs` | `ChainConfig` | Per-chain config struct (camelCase serde). |
+| `rpc.rs` | `ConfigSource` / `DEFAULT_ENDPOINTS` | Who wrote a chain's record, and the built-in public endpoints `init_defaults` seeds (§5.6). |
 | `rpc.rs` | `RpcError` | Error enum: `UnknownChain`, `Proxy`, `Http`, `Rpc{code,message}`, `Parse`. |
 | `proxy.rs` | `ProxyConfig` | Outbound policy: `proxy`, `proxy_required`, `timeout_secs`. |
 | `proxy.rs` | `build_client` | **The only** `reqwest::Client` constructor; fails closed. |
 | `proxy.rs` | `ProxyError` | `ProxyRequiredButUnset`, `ProxyUnusable`, `Build`. |
-| `glue.rs` | `EthRpcModule` (trait) | The module's public contract (16 methods + hook). |
+| `glue.rs` | `EthRpcModule` (trait) | The module's public contract (24 methods + hook). |
 | `glue.rs` | `EthRpcModuleImpl` | The implementation, holding `rpc: RwLock<Option<EthRpc>>`. |
 | `glue.rs` | `with_rpc` / `with_rpc_mut` | Read-lock / write-lock helpers (§9). |
 | `glue.rs` | `logos_module_install` | `#[no_mangle]` install hook → `install::<EthRpcModuleImpl>()`. |
@@ -240,7 +241,11 @@ addresses, hashes, and all JSON blobs are `String`. `chain_id` is internally cas
 Store (insert/replace) the configuration for a chain and persist it.
 - **`chain_id`** — EIP-155 chain id (e.g. `1` mainnet, `10` Optimism).
 - **`config_json`** — a JSON object matching `ChainConfig` (§6):
-  `{ "endpoint": "...", "proxy"?: "...", "proxyRequired"?: bool, "timeoutSecs"?: u64 }`.
+  `{ "endpoint": "...", "proxy"?: "...", "proxyRequired"?: bool, "timeoutSecs"?: u64,
+  "verifiedProxyMode"?: "off"|"required", "verifiedTimeoutSecs"?: u64 }`.
+- An **omitted** `verifiedProxyMode` / `verifiedTimeoutSecs` preserves what is stored; only an
+  explicit `"off"` lowers the mode. `chains.json` is shared, and a sibling wallet that predates
+  verified routing must not revoke a user's security setting by silence.
 - **Returns** `true` on success; `false` if `config_json` fails to parse **or** the
   context is not yet ready (`EthRpc` not initialized).
 - **Lock:** WRITE (one of only two write-lock methods).
@@ -282,6 +287,17 @@ the fail-closed client. On any failure they return `{ "ok": false, "error": "<me
 where the message is the `Display` of the underlying `RpcError` (§6.2): e.g.
 `no configuration for chain <id>`, `proxy: proxy required but none configured ...`,
 `http: <reqwest error>`, `rpc error <code>: <message>`, `parse: <detail>`.
+
+Every success envelope also carries **`route`** — how the answer was obtained:
+
+| `route` | Meaning |
+|---------|---------|
+| `"verified"` | Proof-backed by the light client (`eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt`, `eth_call`). |
+| `"proxied"` | Routed through the verified proxy, but **forwarded to its own execution provider on trust** — receipts, `eth_feeHistory`, `eth_gasPrice`, `eth_estimateGas`, broadcasts. |
+| `"direct"` | Not routed through the proxy at all (the chain's mode is `off`, or the call used `raw_rpc_url`). |
+
+A UI must not badge `"proxied"` as verified: a light client proves state against a header's
+stateRoot and can prove neither a fee oracle's opinion nor that a broadcast was accepted.
 
 #### `verify_chain_id(chain_id: i64) -> String`
 `eth_chainId` round-trip; decodes the hex result to a decimal number.
@@ -394,11 +410,210 @@ not-initialized error (`with_rpc`) or `false` (`with_rpc_mut`).
 | `get_transaction_receipt` | R | `{ ok, result:{…}|null }` |
 | `get_transaction_by_hash` | R | `{ ok, result:{…}|null }` |
 | `raw_rpc` | R | `{ ok, result:<any> }` |
+| `config_status` | R | `{ ok, state, source, chains:[…] }` |
+| `init_defaults` | W | `{ ok, applied, seeded:{…} }` |
+
+Every RPC success shape also carries `route: "verified"|"proxied"|"direct"` (see §5.2).
 
 All "R/W" failures use `{ ok:false, error:"…" }` except the three `bool` methods, which
 return `false`.
 
+### 5.5 The verified-proxy gate (`verified_proxy_status`, `verdict.rs`)
+
+`verified_proxy_status(chain_id) -> { ok, chainId, mode, state, usable, blocking, message,
+action, detail }`. Every key is always present; `detail` is `""`, never absent. `state` is one
+of `disabled | ready | syncing | missing | unconfigured | stopped | wrong_chain | unhealthy`
+and `action` one of `none | wait | install_or_load | open_verified_proxy | restart_or_reload`.
+`ok` is false only when this module has no context — `missing` is an answer, not an error.
+
+**Evaluation order (`verdict::evaluate`) — `modules_state` first.**
+
+1. Mode is not `required` → `disabled`, nothing is called.
+2. Cached verdict younger than `HEALTH_TTL` (5s) → reuse it.
+3. **Readiness**: `modules_state.list_modules()`, 750ms, cached `READY_TTL` (2s) and NOT per
+   chain. A positive "not loaded" returns `missing` here and the probe never runs.
+4. **Probe**: `verified_proxy_module.status()`, `PROBE_BUDGET` 1500ms → `classify_status`.
+5. **Refine**: only if step 4 FAILED, `modules_state.module_record("verified_proxy_module")`,
+   750ms → `classify_modules_state`. It can sharpen the reason, never veto a reachable proxy.
+
+Step 3 is the whole point of the order: with verified mode required and the proxy module not
+loaded, every uncached evaluation used to pay 1500ms + 750ms, and a UI polling on the same 5s
+cadence as `HEALTH_TTL` missed the cache nearly every time.
+
+**What is cached, and for how long (`verdict::GateCache`).** The TTLs are a policy over
+`evaluate`, held apart from it so both are testable with `cargo test --no-default-features`.
+
+| Verdict | Cached? | Why |
+|---------|---------|-----|
+| from step 2/4/5 (the probe ran) | `HEALTH_TTL` | 1500ms + 750ms is exactly what a cache is for. |
+| `missing` from step 3 (short-circuit) | **no** | Free to recompute — the listing under it is already memoized for `READY_TTL`, so caching it again would only extend it. |
+
+`GateCache::invalidate(chain_id)` drops **both** the chain's verdict and the host readiness
+snapshot, and every config mutator (§5.1) calls it. Dropping only the verdict left a retry
+reading a 2s-old "not loaded" and answering `missing` anyway.
+
+**Worst case for "I just installed/loaded the proxy — retry".**
+
+| Retry path | Told `missing` for up to |
+|------------|--------------------------|
+| any config mutator, then read the status | 0 — both caches are dropped |
+| status poll alone, previous verdict was the step-3 short-circuit | `READY_TTL` — 2s |
+| status poll alone, previous verdict was probed (registry unfed or `Loaded`) | `HEALTH_TTL` — 5s |
+
+The second row was `READY_TTL + HEALTH_TTL` (~7s) before the short-circuited verdict stopped
+being cached. Nothing here can fail open: a stale `Loaded` or `Unknown` still falls through to
+the probe, and only a *negative* answer is refused a cache.
+
+**What may short-circuit (`verdict::classify_readiness`).** Only a POSITIVE statement:
+
+| Listing | Readiness | Effect |
+|---------|-----------|--------|
+| complete (`partial:false`), non-empty, proxy not in it | `NotLoaded` | `missing`, no probe |
+| complete, non-empty, proxy record `state:"unloaded"` | `NotLoaded` | `missing`, no probe |
+| complete, non-empty, proxy in any other state | `Loaded` | probe anyway |
+| empty `modules` (whatever `partial` says) | `Unknown` | probe |
+| `partial:true`, or no `partial` field at all | `Unknown` | probe |
+| call failed / null / not a listing | `Unknown` | probe |
+
+An empty or `partial` listing is NO information, not negative information. A host older than
+liblogos `84564f0` (#189) embeds `modules_state` with nothing feeding it, so it answers
+`{"modules":[],"partial":true}` — indistinguishable from "nothing is loaded". Concluding
+`missing` there would blank a working wallet, which is worse than the latency being avoided.
+Artifact-level check for any host: `strings <liblogos>/lib/liblogos_core.dylib | grep -c
+modules_state`; zero means no feed. `list_modules` and not `is_ready`, because a bool cannot
+separate "not loaded" from "the registry has nothing to say" and carries no `partial`.
+
+`Loaded` is not `usable`: loaded says nothing about configured, started, synced, or on the
+right chain, so it is always followed by the probe.
+
+**No dependency.** `modules_state` is reached by an UNTYPED call and stays out of
+`metadata.json` `dependencies`, exactly as `verified_proxy_module` does, so no consumer of this
+module inherits a closure from the gate.
+
+### 5.6 Initialization convention (`config_status`, `init_defaults`)
+
+The module is usable with **no external configuration**: a consumer asks whether a config has
+been set, and if not seeds the built-in public endpoints. Neither method performs network I/O
+or calls another module, so both are cheap enough for a consumer's context-ready path.
+
+Two independent questions, kept apart by the `state` field — never by matching the message:
+
+| question | `state` |
+|---|---|
+| has `on_context_ready` run? | `unready` (and `ok:false`) |
+| has a config been *set*? | `unconfigured` / `configured` |
+
+#### `config_status() -> String`
+Whether a config has been set, per chain and rolled up.
+- **Success:** `{ ok:true, state:"configured"|"unconfigured", source:"external"|"default"|"none",
+  chains:[ { chainId, state, source, endpoint?, verifiedProxyMode? } ] }`.
+- `chains` is the **union** of the stored chains and `DEFAULT_ENDPOINTS`, sorted by `chainId`;
+  a chain with no record is listed as `state:"unconfigured", source:"none"` and carries no
+  `endpoint`.
+- Module-level `state` is `configured` if **any** chain is; `source` is `external` if **any**
+  chain is. This roll-up is for **display only, not a gate**: a store with chain 1 configured
+  and 11155111 absent rolls up to `configured` while still needing seeding.
+- **Error:** `{ ok:false, state:"unready", error:"eth_rpc not initialized (context not ready)" }`.
+- **Lock:** READ.
+
+#### `init_defaults() -> String`
+Seed the built-in endpoints, per chain and per **field**, only where absent.
+- **Success:** `{ ok:true, applied:bool, seeded:{ "<chainId>": ["*"|"endpoint", …] } }`.
+  `"*"` means the whole record was written; `[]` means the chain was already there.
+  `applied` is `true` iff any chain was written.
+- **Idempotent, and idempotent across restarts.** A second call — from any consumer — writes
+  nothing and answers `applied:false`, which is **not an error**. Two consumers racing both
+  succeed; exactly one sees `applied:true`.
+- Implemented as [`EthRpc::ensure_chain_config`] in a loop, so it is idempotent **per chain**
+  and a consumer may call it unconditionally rather than gating on `config_status`.
+- Every chain it writes has its memoized verified-proxy verdict invalidated (§5.5).
+- **Error:** the same `state:"unready"` refusal as above.
+- **Lock:** WRITE.
+
+#### The built-in endpoints (`DEFAULT_ENDPOINTS`, `rpc.rs`)
+
+| Chain | id | Endpoint |
+|---|---|---|
+| Ethereum | `1` | `https://ethereum-rpc.publicnode.com` |
+| Sepolia | `11155111` | `https://ethereum-sepolia-rpc.publicnode.com` |
+| Hoodi | `560048` | `https://ethereum-hoodi-rpc.publicnode.com` |
+
+Measured live 2026-08-28. **One endpoint per chain, not a list**: a silent failover changes
+*which* node answered without the consumer knowing, and picking a different one is
+`eth_rpc_ui`'s job. `verifiedProxyMode` is `off` on every seeded record — verified routing
+needs an archive node these are not, and `validate()` refuses it beside `proxyRequired`.
+
+> **All three are one operator.** publicnode therefore sees the traffic of every
+> default-configured wallet. That is a reason `eth_rpc_ui` and the SOCKS `proxy` setting
+> exist — not a reason to ship an endpoint that does not work.
+
+#### Never downgrade
+
+`init_defaults` can only ever **fill an absent slot**: an absent record, or an absent field of
+a record already there. It writes over nothing, whatever the record's `source`. `chains.json`
+is shared with other wallets on the device, so this is the same discipline `ChainConfigWire`
+already applies to `set_chain_config` (§6.1).
+
+`source` records who wrote a chain, so a UI can tell a value the user chose from one chosen
+for them. It upgrades **one way**, `default` → `external`: every caller-facing write path
+(`set_chain_config`, `patch_chain_endpoint`, `set_verified_proxy_mode`, `patch_chain_transport`)
+sets `external`. It gates nothing — `ensure_chain_config` is what actually refuses to
+overwrite. No caller can send it: `ChainConfigWire` has no such field, and the seeding path
+that does parse a whole `ChainConfig` forces `external` (`ChainConfig::from_caller_json`).
+The field stays deserializable only so `chains.json` reads back.
+
 ---
+
+---
+
+### 5.7 Events (`EthRpcModuleEvents`)
+
+Declared as the companion trait `EthRpcModuleEvents` in `src/glue.rs`; the builder derives the
+`.lidl` event declarations from it and generates the `emit_*` free functions.
+
+| event | payload | when |
+|---|---|---|
+| `chain_config_changed` | `chain_id: i64` | that chain's stored record was added, removed or altered |
+| `verified_proxy_mode_changed` | `chain_id: i64`, `mode: String` | the verified-proxy gate for that chain moved; `mode` is the value now in force (`"off"` / `"required"`) |
+
+**Granularity.** Per chain, not per field and not one global "something changed". A consumer
+redraws or re-reads a whole chain row anyway, so per-field events would only add noise; a
+single global event would make a three-chain consumer re-read all three because one moved.
+Neither event carries the config itself — this module is the single owner of that record, and
+a copy on the event plane is a second place it can go stale. `verified_proxy_mode_changed` is
+a **refinement** of `chain_config_changed`, not an alternative: a mode change emits both, so a
+consumer that only redraws configuration subscribes to one event and a wallet that only gates
+subscribes to the other. The mode is the one field carried inline, because it is the one a
+wallet branches on before deciding whether to ask anything else.
+
+**Which methods emit.** Every mutator, and only on a real change:
+
+| method | emits |
+|---|---|
+| `set_chain_config` | `chain_config_changed`; also the mode event when the wire moved the mode |
+| `remove_chain_config` | `chain_config_changed`; and `verified_proxy_mode_changed(id, "off")` when the removed chain was `required` |
+| `set_verified_proxy_mode` | both, on an accepted change |
+| `patch_chain_endpoint`, `patch_chain_transport`, `ensure_chain_config` | `chain_config_changed` |
+| `init_defaults` | `chain_config_changed` per chain it actually seeded |
+
+Every read method — `get_chain_config`, `list_chains`, `config_status`, `verified_proxy_status`
+and the RPC calls — is silent.
+
+**Two invariants, both tested (`rpc.rs`, `mod change_tests`):**
+
+1. *Emit only on an actual change.* The decision is `diff_chain(before, after)` over the stored
+   record, taken inside the write lock — never "a setter was called". A sibling wallet that
+   pushes the same config on every start, a `set_verified_proxy_mode` to the mode already in
+   force, a re-`patch` of the same endpoint, a refused switch, a second `init_defaults`: all
+   silent. Without this the wallet would be woken by the sibling's harmless startup write.
+2. *State before event.* The write lock is released before the emit, and the store persists
+   inside the mutator, so a subscriber calling straight back into `get_chain_config` or
+   `verified_proxy_status` reads the new value. Emitting under the lock would let a subscriber
+   read back the value it was just told had changed.
+
+An absent record counts as mode `off` on both sides of the diff — the same reading
+`verified_proxy_status` gives it — so removing a `required` chain closes the gate loudly, and
+seeding a fresh chain (whose builtin record is `off`) moves no gate and emits no mode event.
 
 ## 6. Configuration & data model
 
@@ -414,7 +629,13 @@ pub struct ChainConfig {
     #[serde(default)]
     pub proxy_required: bool,             // JSON: "proxyRequired" — fail-closed switch
     #[serde(default = "default_timeout")]
-    pub timeout_secs: u64,                // JSON: "timeoutSecs" — default 30
+    pub timeout_secs: u64,                // JSON: "timeoutSecs" — default 8
+    #[serde(default)]
+    pub verified_proxy_mode: VerifiedProxyMode,  // JSON: "verifiedProxyMode" — off | required
+    #[serde(default = "default_verified_timeout")]
+    pub verified_timeout_secs: u64,       // JSON: "verifiedTimeoutSecs" — default 15
+    #[serde(default)]
+    pub source: ConfigSource,             // JSON: "source" — external | default (§5.6)
 }
 ```
 
@@ -423,7 +644,10 @@ pub struct ChainConfig {
 | `endpoint` | string | — (required) | RPC URL the requests POST to. |
 | `proxy` | string? | absent → `None` | Proxy URL. Schemes: `socks5h`, `socks5`, `http`, `https`. `socks5h` resolves DNS through the proxy (Tor-preferred). |
 | `proxyRequired` | bool | `false` | If `true`, requests must traverse a proxy; with none usable the client fails closed. |
-| `timeoutSecs` | u64 | `30` | Per-request timeout. `0` leaves reqwest's default. |
+| `timeoutSecs` | u64 | `8` | Per-request timeout. `0` leaves reqwest's default. |
+| `verifiedProxyMode` | `"off"` \| `"required"` | `"off"` | `required` routes through the light-client proxy and REFUSES rather than falling back (§5.2). Contradicts `proxyRequired`, which `validate()` rejects. |
+| `verifiedTimeoutSecs` | u64 | `15` | Budget for one call on the verified leg — a second hop, so more room than `timeoutSecs`. Read per call from this record and **clamped to 1..=60**: 0 would time out instantly, and an unbounded value never returns. |
+| `source` | `"external"` \| `"default"` | absent → `"external"` | Who wrote the record (§5.6). Reporting only, and **a caller cannot declare its own write to be a default**: `ChainConfigWire` omits the field, and the one path that parses a whole `ChainConfig` from caller JSON (`ensure_chain_config`) goes through `ChainConfig::from_caller_json`, which forces `external`. Absent on a pre-existing `chains.json` reads as `external` — a record already on disk was written by somebody. |
 
 > **camelCase is load-bearing.** The wallet backend emits `proxyRequired` / `timeoutSecs`.
 > A regression test (`camelcase_proxy_required_is_honored`) asserts the serde mapping holds
@@ -438,6 +662,8 @@ pub struct ChainConfig {
 | `Http(e)` | `http: <reqwest error>` |
 | `Rpc { code, message }` | `rpc error <code>: <message>` (node-returned JSON-RPC error) |
 | `Parse(e)` | `parse: <detail>` (bad response shape / bad hex) |
+| `VerifiedProxy(e)` | `verified proxy: <e>` — the verified leg could not answer. Never downgraded to a direct call. |
+| `VerifiedBypass(m)` | `<m> is proof-backed on this chain's verified route: refused through an explicit url, which cannot prove it (use raw_rpc)` |
 
 ### 6.3 `ProxyConfig` / `ProxyError` (`proxy.rs`)
 
@@ -459,7 +685,7 @@ State is a single JSON file at `<instance_persistence_path>/chains.json`, writte
 ```json
 {
   "1":  { "endpoint": "https://eth.example",  "proxy": null, "proxyRequired": false, "timeoutSecs": 30 },
-  "10": { "endpoint": "https://op.example",   "proxy": "socks5h://127.0.0.1:9050", "proxyRequired": true, "timeoutSecs": 30 }
+  "10": { "endpoint": "https://op.example",   "proxy": "socks5h://127.0.0.1:9050", "proxyRequired": true, "timeoutSecs": 30, "source": "external" }
 }
 ```
 
@@ -467,6 +693,9 @@ State is a single JSON file at `<instance_persistence_path>/chains.json`, writte
 - The parent directory is created on first write (`create_dir_all`).
 - The file is rewritten in full on every `set_chain_config` / `remove_chain_config`.
 - Config survives a daemon restart (proven by `config_store_roundtrip_persists`).
+- The absence of this file is the only signal that nothing has been configured, which is what
+  makes `init_defaults` idempotent **across process lifetimes** and not merely within one
+  (`initialization_is_still_a_no_op_after_a_restart`).
 
 ---
 
@@ -534,6 +763,22 @@ Tests present (all in-source `#[cfg(test)]`):
 | `fail_closed_when_required_and_unset` (proxy) | `ProxyRequiredButUnset`. |
 | `ok_when_not_required_and_unset` (proxy) | clear-net allowed when not required. |
 | `rejects_unsupported_scheme` (proxy) | unsupported proxy scheme rejected. |
+
+The initialization convention (§5.6) has its own module, `rpc::defaults_tests`:
+
+| Test | What it proves |
+|------|----------------|
+| `the_shipped_defaults_cover_the_wallets_three_chains_with_verified_routing_off` | the table is 1 / 11155111 / 560048, all `https`, all `verifiedProxyMode: off`, all representable. |
+| `initializing_twice_writes_nothing_the_second_time` | first call seeds `["*"]` per chain; the second seeds nothing and the store is byte-identical. |
+| `initialization_is_still_a_no_op_after_a_restart` | idempotence survives a process lifetime, via `chains.json`. |
+| `a_user_endpoint_and_verified_mode_survive_initialization` | a configured chain keeps its endpoint, verified mode and both timeouts; the absent chains are still seeded. |
+| `a_default_fills_an_absent_endpoint_without_touching_the_rest_of_the_record` | per-FIELD seeding: an empty endpoint is filled, the user's `proxy`/`proxyRequired` are not reset. |
+| `a_users_edit_relabels_a_defaulted_chain_as_theirs` | all four caller-facing write paths promote `source` to `external`. |
+| `a_caller_cannot_declare_its_own_write_to_be_a_default` | `source` from a caller is ignored on **both** caller paths — `apply_chain_config` (wire) and `from_caller_json` (seeding) — so a caller cannot license us to overwrite it, nor have `config_status` label its record built-in. |
+| `a_chains_json_written_before_source_existed_reads_back_as_external` | fail closed on a pre-existing store. |
+| `an_empty_store_reports_unconfigured_and_still_lists_what_it_could_seed` | the `unconfigured` / `source:"none"` shape. |
+| `config_status_separates_a_default_from_a_value_the_user_chose` | per-chain `source`, and one external chain making the roll-up external. |
+| `a_chain_outside_the_defaults_is_reported_but_never_seeded` | the union is reported; `init_defaults` touches only its own table. |
 
 ### 8.2 Build / package via nix
 

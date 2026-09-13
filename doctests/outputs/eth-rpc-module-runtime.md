@@ -41,6 +41,11 @@ echo 'experimental-features = nix-command flakes' >> ~/.config/nix/nix.conf
 
 ### 1.1 Build logoscore
 
+`eth_rpc_module` is `concurrency: "multi"`, so the daemon resolves its
+deferred replies on the caller's behalf — it must be built against
+logos-protocol ≥ 0.2. The `--override-input` pins its protocol (and
+liblogos's) to the chain under test (master, where 0.2 lives).
+
 ```bash
 nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos
 ```
@@ -95,7 +100,7 @@ the round-trip is deterministic and offline.
 ### 3.1 Write the mock node
 
 ```
-import http.server, json
+import http.server, json, socketserver, time
 RES = {"eth_chainId": "0x1", "eth_getBalance": "0x1234", "eth_blockNumber": "0x10"}
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
@@ -108,7 +113,22 @@ class H(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
     def log_message(self, *a): pass
-http.server.HTTPServer(('127.0.0.1', 8599), H).serve_forever()
+# Threaded because eth_rpc_module is concurrency: "multi" and opens a fresh
+# connection per call, so the single-threaded server would serialise them.
+class Node(http.server.ThreadingHTTPServer):
+    # HTTPServer.server_bind() looks the host up in reverse DNS BETWEEN bind() and
+    # listen(), and nothing here needs the FQDN. Until that lookup answers the port
+    # is bound but not yet listening, so a caller's connect never completes; on a CI
+    # box whose resolver drops reverse queries for 127.0.0.1 that ran past 30s and
+    # read as an unreachable node.
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+t0 = time.time()
+srv = Node(('127.0.0.1', 8599), H)
+host, port = srv.server_address[:2]
+print('listening on %s:%d after %.1fs' % (host, port, time.time() - t0), flush=True)
+srv.serve_forever()
 ```
 
 ### 3.2 Start the mock node
@@ -117,8 +137,39 @@ http.server.HTTPServer(('127.0.0.1', 8599), H).serve_forever()
 python3 mock_node.py &
 ```
 
+### 3.3 Write the readiness check
+
+```
+import json, socket, sys, time, urllib.request
+deadline = time.time() + 30
+while time.time() < deadline:
+    try:
+        socket.create_connection(("127.0.0.1", 8599), timeout=1).close()
+        break
+    except OSError:
+        time.sleep(0.2)
+else:
+    try: log = open("mock.log").read().strip() or "(empty)"
+    except OSError: log = "(no mock.log)"
+    sys.exit("nothing accepted on 127.0.0.1:8599 after 30s; mock.log: " + log)
+req = urllib.request.Request(
+    "http://127.0.0.1:8599",
+    data=json.dumps({"jsonrpc": "2.0", "id": 1,
+                     "method": "eth_chainId", "params": []}).encode(),
+    headers={"content-type": "application/json"})
+print("mock node answered:", urllib.request.urlopen(req, timeout=5).read().decode())
+```
+
+### 3.4 Wait until the node answers
+
+`python3 mock_node.py &` returns once the shell has forked, not once the listener is
+up, so this waits for a connection rather than guessing at a sleep. Answering
+`eth_chainId` here also separates the fixture from the module: if this passes and the
+round-trip below fails, the node was reachable and the module's transport is what did
+not reach it.
+
 ```bash
-sleep 2
+python3 wait_for_node.py
 ```
 
 ---
@@ -200,8 +251,10 @@ logoscore call eth_rpc_module get_balance 9 <address>
 ### 4.11 Stop the daemon and the mock node
 
 ```bash
-./logos/bin/logoscore stop
+trap '' TERM
+./logos/bin/logoscore stop || true
 pkill -f mock_node.py 2>/dev/null || true
+true
 
 ```
 

@@ -3,17 +3,44 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
+
+    # Declared OPTIONAL in metadata.json: typed, and tolerated when absent. Each contributes
+    # its published `packages.<system>.lidl` -- verified_proxy_module's is a single
+    # 19,928-byte contract.
+    #
+    # A REQUIRED declaration would not pull libverifproxy in either: measured, the closure holds
+    # 0 nimbus paths and `.#install` stages only this module either way. `optional` is about
+    # absence being tolerated, not about the closure.
+    #
+    # The follows is for LOCK SIZE, not compatibility: without it each dependency drags its own
+    # module-builder subtree and this lock goes 756 -> 2250 nodes. The contract is unaffected
+    # either way -- measured byte-identical with and without.
+    modules_state = {
+      url = "github:logos-co/logos-modules-state-module";
+      inputs.logos-module-builder.follows = "logos-module-builder";
+    };
+    verified_proxy_module = {
+      url = "github:logos-co/logos-verified-proxy-module";
+      inputs.logos-module-builder.follows = "logos-module-builder";
+    };
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:
     let
       nixpkgs = logos-module-builder.inputs.nixpkgs;
       systems = [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" "x86_64-linux" ];
-      forAllSystems = f: nixpkgs.lib.genAttrs systems f;
+
+      # x86_64-windows is a cross PSEUDO-SYSTEM the builder already understands
+      # (logos-module-builder lib/common.nix routes it to
+      # logos-nix.lib.mkWindowsPkgs, and picks the build platform separately).
+      # It is a target, never a host we evaluate nixpkgs natively for, so it
+      # only ever belongs in `packages`.
+      targets = systems ++ [ "x86_64-windows" ];
+      forAllTargets = f: nixpkgs.lib.genAttrs targets f;
 
       # ONE module, answered for every target at once. mkLogosModule already
-      # keys its own outputs by system, so calling it per system built four
-      # copies of the same evaluation and threw three away.
+      # keys its own outputs by system, so calling it per target built five
+      # copies of the same evaluation and threw four away.
       module = logos-module-builder.lib.mkLogosModule {
         src = ./.;
         configFile = ./metadata.json;
@@ -21,7 +48,7 @@
       };
 
       # The mobile pseudo-systems logos-nix keys its cross package sets by. Kept
-      # out of `systems` above for the reason the builder keeps them out of its
+      # out of `targets` above for the reason the builder keeps them out of its
       # own: a phone gets the Bare image and none of the other outputs. `?
       # ${t}` rather than a bare index, so a logos-module-builder pin without
       # the mobile cross sets leaves this flake simply WITHOUT mobile keys
@@ -36,7 +63,7 @@
         [ "aarch64-ios" "aarch64-ios-simulator" "aarch64-android" ];
     in
     {
-      packages = forAllSystems (system: module.packages.${system})
+      packages = forAllTargets (system: module.packages.${system})
               // nixpkgs.lib.genAttrs mobileTargets (t: module.packages.${t});
 
       # An Android cross derivation's `system` is its BUILD platform, so
