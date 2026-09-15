@@ -5,6 +5,7 @@
   "author": "Logos Core Team",
   "type": "core",
   "interface": "cdylib",
+  "platform": true,
   "concurrency": "multi",
   "category": "wallet",
   "main": "eth_rpc_module_plugin",
